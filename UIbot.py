@@ -1,7 +1,6 @@
 import os
 import time
 import requests
-import base64
 import streamlit as st
 from dotenv import load_dotenv
 import tiktoken
@@ -9,22 +8,11 @@ import tiktoken
 # Load .env variables
 load_dotenv()
 IONOS_API_TOKEN = os.getenv("IONOSKEY")
-COLLECTION_ID = "ca216380-01e4-487b-9217-006de4399736"
-MODEL_ID = "0b6c4a15-bb8d-4092-82b0-f357b77c59fd"
 
-# Token counting
-def count_tokens(text, model="gpt-4"):
-    enc = tiktoken.encoding_for_model(model)
-    return len(enc.encode(text))
 
-# Truncate context
-def truncate_context_to_fit_tokens(text, max_tokens=3000, model="gpt-4"):
-    enc = tiktoken.encoding_for_model(model)
-    tokens = enc.encode(text)
-    truncated = tokens[:max_tokens]
-    return enc.decode(truncated)
 
-# Get recent conversation from Streamlit session
+
+# Retrieve recent conversation from chat history
 def get_recent_conversation():
     history = st.session_state.chat_history[-10:]  # last 5 turns
     return "\n".join([
@@ -32,9 +20,9 @@ def get_recent_conversation():
         for role, msg in history if msg.strip()
     ])
 
-# LLaMA API call
+# Call your LLaMA 3.1 endpoint
 def llama_completion(prompt):
-    endpoint = f"https://inference.de-txl.ionos.com/models/{MODEL_ID}/predictions"
+    endpoint = "https://inference.de-txl.ionos.com/models/0b6c4a15-bb8d-4092-82b0-f357b77c59fd/predictions"
     headers = {
         "Authorization": f"Bearer {IONOS_API_TOKEN}",
         "Content-Type": "application/json"
@@ -43,44 +31,67 @@ def llama_completion(prompt):
     response = requests.post(endpoint, json=body, headers=headers).json()
     return response["properties"]["output"].strip()
 
-# Retrieve context documents
-def retrieve_context(query, limit=3):
-    endpoint = f"https://inference.de-txl.ionos.com/collections/{COLLECTION_ID}/query"
-    headers = {
-        "Authorization": f"Bearer {IONOS_API_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    body = {"query": query, "limit": limit}
-    relevant_documents = requests.post(endpoint, json=body, headers=headers)
-    return [
-        base64.b64decode(entry['document']['properties']['content']).decode()
-        for entry in relevant_documents.json()['properties']['matches']
-    ]
+# Verify if retrieved context is sufficient
+def verify_documents(question, context):
+    context = truncate_context_to_fit_tokens(context)
+    prompt = (
+        f"Do these documents fully support answering the question below? Answer with Yes or No ONLY.\n\n"
+        f"Documents:\n{context}\n\nQuestion: {question}\n\nAnswer:"
+    )
+    return "yes" in llama_completion(prompt).lower()
 
-# Generate response
+# Generate better query if initial one fails
+def get_missing_info_query(question, context):
+    context = truncate_context_to_fit_tokens(context)
+    prompt = (
+        f"What is missing from these documents to fully answer the question?\n"
+        f"Generate a new query that could help retrieve the missing information.\n\n"
+        f"Context:\n{context}\n\nQuestion: {question}\n\nImproved Query:"
+    )
+    return llama_completion(prompt)
 
+# Generate a response from user input and context
 def generate_response(question, context):
-    truncated_context = truncate_context_to_fit_tokens(context)
+    context = truncate_context_to_fit_tokens(context)
     history = get_recent_conversation()
     prompt = (
         f"You are a helpful assistant. Use the following context to answer the user's question truthfully and in one sentence.\n\n"
         f"Conversation so far:\n{history}\n\n"
-        f"Context:\n{truncated_context}\n\n"
-        f"Question: {question}\n\n"
-        f"Answer:"
+        f"Context:\n{context}\n\nQuestion: {question}\n\nAnswer:"
     )
     return llama_completion(prompt)
 
-# Fallback response if context fails
+# Generic fallback response if context is empty
 def fallback_general_response(question):
     history = get_recent_conversation()
     prompt = (
         f"You are an assistant that helps users based on general knowledge and prior conversation.\n"
-        f"Never hallucinate. Respond with 'I don't know' if unsure.\n\n"
+        f"Never hallucinate. Respond with 'I don\'t know' if unsure.\n\n"
         f"Conversation so far:\n{history}\n\n"
         f"User's question: {question}\n\nAnswer:"
     )
     return llama_completion(prompt)
+
+# Log retrieval attempts
+def log_retrievals(query, retrieved_docs, round_id, token_count):
+    with open("retrieval_logs.txt", "a", encoding="utf-8") as f:
+        f.write(f"\n=== Retrieval Round {round_id} ===\n")
+        f.write(f"Query: {query}\n")
+        f.write(f"Tokens: {token_count}\n")
+        for i, text in enumerate(retrieved_docs, 1):
+            snippet = text[:500].replace("\n", " ").replace("\r", " ")
+            f.write(f"\n--- Document {i} ---\nContent Snippet: {snippet}...\n")
+        f.write("\n")
+
+# Get relevant context from Weaviate
+def retrieve_context(query, limit=6):
+    results = my_collection.query.near_text(
+        query=query,
+        target_vector="rag_vector_openai",
+        limit=limit,
+        return_metadata=MetadataQuery(score=True)
+    )
+    return [obj.properties["text"] for obj in results.objects]
 
 # Streamlit UI
 st.set_page_config(page_title="RAG Chatbot (LLaMA)", layout="centered")
@@ -116,9 +127,23 @@ if user_input:
     with st.chat_message("assistant", avatar="🤖"):
         msg_placeholder = st.empty()
         with st.spinner("Retrieving context and generating response..."):
-            docs = retrieve_context(user_input)
-            if docs:
-                final_context = "\n".join(docs)
+            query = user_input
+            final_context = ""
+            max_retries = 2
+            for i in range(max_retries):
+                docs = retrieve_context(query)
+                if not docs:
+                    break
+                context = "\n".join(docs)
+                log_retrievals(query, docs, i + 1, token_count=count_tokens(context))
+                if verify_documents(user_input, context):
+                    final_context = context
+                    break
+                else:
+                    query = get_missing_info_query(user_input, context)
+                    time.sleep(1.2)
+
+            if final_context:
                 full_answer = generate_response(user_input, final_context)
             else:
                 full_answer = fallback_general_response(user_input)
